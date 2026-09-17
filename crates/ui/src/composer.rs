@@ -8196,25 +8196,6 @@ mod tests {
         });
     }
 
-    struct RecordingRpc {
-        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl zeron_rpc::RpcService for RecordingRpc {
-        async fn handle(
-            &self,
-            method: &str,
-            params: serde_json::Value,
-        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((method.to_string(), params));
-            zeron_rpc::RpcReply::value(&serde_json::json!({}))
-        }
-    }
-
     /// Issue #406: Enter submits — it must never stop a run. Stop mode only
     /// exists on a live run with an EMPTY composer, so a habitual
     /// double-Enter after sending interrupted the just-dispatched prompt
@@ -8222,16 +8203,16 @@ mod tests {
     /// job; Enter on an empty composer is a no-op.
     #[gpui::test]
     fn enter_on_empty_composer_during_a_live_run_never_interrupts(cx: &mut gpui::TestAppContext) {
-        // memory_client spawns its server on tokio — give the test a reactor.
+        // RpcClient::new spawns its reader on tokio — give the test a reactor.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The client's write end: any RPC Enter dispatches lands here.
+        let (out, mut server_in) = tokio::sync::mpsc::channel::<String>(16);
+        let (_server_out, inbound) = tokio::sync::mpsc::channel::<String>(16);
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, _| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                zeron_rpc::memory_client(std::sync::Arc::new(RecordingRpc {
-                    calls: calls.clone(),
-                })),
+                zeron_rpc::RpcClient::new(out, inbound),
             ));
             state.selected_chat = Some("c".into());
             // A send in flight reads as Working — the double-Enter window.
@@ -8244,13 +8225,10 @@ mod tests {
             // interrupt_chat marks the chat before its RPC even flies.
             assert!(!composer.interrupting.contains("c"));
         });
-        // If Enter had dispatched an interrupt, the spawned call would land on
-        // the recording service once both executors get a turn.
+        // If Enter had dispatched an interrupt, the spawned call would have
+        // written its frame into the channel by the time the executor parks.
         cx.run_until_parked();
-        runtime.block_on(async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        });
-        assert!(calls.lock().unwrap().is_empty());
+        assert!(server_in.try_recv().is_err());
     }
 
     /// The press intent is judged by eye everywhere except here: that a
